@@ -1,173 +1,200 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* scx_cake BPF/userspace interface - shared data structures and constants */
+/* scx_imperator BPF/userspace interface - shared data structures and constants */
 
 #ifndef __CAKE_INTF_H
 #define __CAKE_INTF_H
 
 #include <limits.h>
 
-/* Type defs for BPF/userspace compat - defined when vmlinux.h is not included */
 #ifndef __VMLINUX_H__
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long u64;
-
 typedef signed char s8;
 typedef signed short s16;
 typedef signed int s32;
 typedef signed long s64;
 #endif
 
-/* CAKE TIER SYSTEM — 4-tier classification by avg_runtime
- *
- * Tiers group tasks with similar scheduling needs. Classification is
- * purely by EWMA avg_runtime — shorter runtime = more latency-sensitive.
- * DRR++ deficit handles intra-tier fairness (yield vs preempt). */
-enum cake_tier {
+/* CAKE TIER SYSTEM — 4-tier classification by avg_runtime */
+enum imperator_tier {
     CAKE_TIER_CRITICAL  = 0,  /* <100µs:  IRQ, input, audio, network */
     CAKE_TIER_INTERACT  = 1,  /* <2ms:    compositor, physics, AI */
     CAKE_TIER_FRAME     = 2,  /* <8ms:    game render, encoding */
     CAKE_TIER_BULK      = 3,  /* ≥8ms:    compilation, background */
-    CAKE_TIER_IDLE      = 255,
     CAKE_TIER_MAX       = 4,
 };
+
+#define CAKE_TIER_IDX(t)  ((t) & 7)
+_Static_assert(CAKE_TIER_MAX <= 8,
+    "CAKE_TIER_MAX exceeds array size — update CAKE_TIER_IDX mask");
 
 #define CAKE_MAX_CPUS 64
 #define CAKE_MAX_LLCS 8
 
-/* Per-LLC DSQ base — DSQ IDs are LLC_DSQ_BASE + llc_index (0..nr_llcs-1) */
 #define LLC_DSQ_BASE 200
 
-/* Flow state flags (only CAKE_FLOW_NEW currently used) */
-enum cake_flow_flags {
-    CAKE_FLOW_NEW = 1 << 0,  /* Task is newly created */
+#define CAKE_ETD_CROSS_LLC_THRESHOLD 5
+
+/* FLOW STATE FLAGS */
+enum imperator_flow_flags {
+    CAKE_FLOW_NEW         = 1 << 0,
+    CAKE_FLAG_LOCK_HOLDER = 1 << 1,
+    CAKE_FLOW_IRQ_WAKE    = 1 << 2,
 };
 
-/* Per-task flow state - 64B aligned, first 16B coalesced for cake_stopping writes */
-struct cake_task_ctx {
-    /* --- Hot Write Group (cake_stopping) [Bytes 0-15] --- */
-    u64 next_slice;        /* 8B: Pre-computed slice (ns) */
+/* Per-task flow state — 64B, one cache line */
+struct imperator_task_ctx {
+    /* Hot write group (imperator_stopping) [Bytes 0-15] */
+    u64 next_slice;
 
-    /* STATE FUSION: Union allows atomic u64 access to both state fields */
     union {
         struct {
             union {
                 struct {
-                    u16 deficit_us;        /* 2B: Deficit (us) */
-                    u16 avg_runtime_us;    /* 2B: EMA runtime estimate */
+                    u16 deficit_us;
+                    u16 avg_runtime_us;
                 };
-                u32 deficit_avg_fused;     /* 4B: Fused access */
+                u32 deficit_avg_fused;
             };
-            u32 packed_info;               /* 4B: Bitfield */
+            u32 packed_info;
         };
-        u64 state_fused_u64;               /* 8B: Direct burst commit */
+        u64 state_fused_u64;
     };
 
-    /* --- Timestamp (cake_running) [Bytes 16-19] --- */
-    u32 last_run_at;       /* 4B: Last run timestamp (ns), wraps 4.2s */
+    /* Timestamp (imperator_running) [Bytes 16-19] */
+    u32 last_run_at;
 
-    /* --- Graduated backoff counter [Bytes 20-21] --- */
-    u16 reclass_counter;   /* 2B: Per-task stop counter for per-tier backoff */
+    /* Graduated backoff counter [Bytes 20-21] */
+    u16 reclass_counter;
 
-    u8 __pad[42];          /* Pad to 64 bytes: 8+8+4+2+42 = 64 */
+    /* S5: overrun_count — 8-bit shift register of execution outcomes.
+     *
+     * IMPLEMENTED AS: bit-history shift register (imperator_bpf.c [H] s6).
+     *
+     * SEMANTICS: Each stop, the register shifts left one position and the
+     * current bout's result is inserted in the LSB.  The oldest result falls
+     * off the MSB.
+     *
+     *   bit value 1 → that bout's rt_clamped exceeded 1.5× the tier gate
+     *   bit value 0 → that bout ran within the gate
+     *
+     * DEMOTION TRIGGER: __builtin_popcount(overrun_count) >= 4
+     *   Fires when 4 of the last 8 bouts exceeded the gate.
+     *
+     * BEHAVIORAL SUPERSET OF ORIGINAL CONSECUTIVE COUNTER:
+     *   4 consecutive overruns → hist = 0b00001111 → popcount = 4 ≥ 4 → DEMOTE
+     *   This is identical to the original counter-based trigger at N=4.
+     *
+     * NEW CAPABILITY (non-consecutive detection):
+     *   4 alternating overruns over 8 bouts → popcount = 4 ≥ 4 → DEMOTE
+     *   Original counter reset on every normal bout and never fired.
+     *   Example: physics thread spiking every other frame for 8 frames.
+     *
+     * This change is strictly a superset of the original: every pattern that
+     * triggered before still triggers; additional patterns now also trigger.
+     *
+     * THRESHOLD: 4 (not 5 — threshold 5 was a regression: 4 consecutive
+     * overruns → popcount=4 < 5 → no demotion, breaking parity with the
+     * original consecutive counter that fired at exactly 4).
+     *
+     * INIT VALUE: 0 (empty history, no overruns observed) — set explicitly
+     * by alloc_task_ctx_cold; also reset on exec in imperator_init_task.
+     * FIELD NAME: kept as `overrun_count` to avoid disrupting external tools;
+     *             the type (u8) and offset (byte 22) are unchanged.
+     * NO STRUCT SIZE CHANGE: __pad[39] is unchanged. */
+    u8 overrun_count;
+
+    u8 lock_skip_count;
+
+    /* pending_futex_op — tracepoint fallback op storage (lock_bpf.c).
+     *
+     * Stores the futex op recorded at sys_enter_futex so sys_exit_futex can
+     * act on it even if the task migrated CPUs while sleeping (blocking futex
+     * variants park the task inside the kernel and may wake it on a different
+     * CPU from where it entered).
+     *
+     * INIT VALUE: CAKE_FUTEX_OP_UNSET (0xFF) — written explicitly by
+     * alloc_task_ctx_cold.  BPF task-storage zero-initialises new entries
+     * (giving 0 == CAKE_FUTEX_WAIT), which would cause a false set_lock_holder()
+     * on the first sys_exit_futex(ret=0) before any sys_enter_futex is observed.
+     * The explicit 0xFF init makes the UNSET guard in imperator_tp_exit_futex safe
+     * from the very first syscall. */
+    u8 pending_futex_op;
+    u8 __pad[39];
 } __attribute__((aligned(64)));
 
-/* Bitfield layout for packed_info (write-set co-located, Rule 24 mask fusion):
+_Static_assert(sizeof(struct imperator_task_ctx) == 64,
+    "imperator_task_ctx must be exactly 64B (one cache line) — update __pad if fields change");
+
+/* packed_info bitfield layout:
  * [Stable:2][Tier:2][Flags:4][Rsvd:8][Wait:8][Error:8]
- *  31-30     29-28   27-24    23-16   15-8     7-0
- * TIER+STABLE adjacent → fused 4-bit clear/set in reclassify (2 ops vs 4) */
+ *  31-30     29-28   27-24    23-16   15-8     7-0      */
 #define SHIFT_KALMAN_ERROR  0
 #define SHIFT_WAIT_DATA     8
-#define SHIFT_FLAGS         24  /* 4 bits: flow flags */
-#define SHIFT_TIER          28  /* 2 bits: tier 0-3 (coalesced with STABLE) */
-#define SHIFT_STABLE        30  /* 2 bits: tier-stability counter (0-3) */
+#define SHIFT_FLAGS         24
+#define SHIFT_TIER          28
+#define SHIFT_STABLE        30
 
-#define MASK_KALMAN_ERROR   0xFF  /* 8 bits: 0-255 */
-#define MASK_WAIT_DATA      0xFF  /* 8 bits: violations<<4 | checks */
-#define MASK_TIER           0x03  /* 2 bits: 0-3 */
-#define MASK_FLAGS          0x0F  /* 4 bits */
+#define MASK_KALMAN_ERROR   0xFF
+#define MASK_WAIT_DATA      0xFF
+#define MASK_TIER           0x03
+#define MASK_FLAGS          0x0F
 
-/* Load fusing helpers for deficit_avg_fused */
 #define EXTRACT_DEFICIT(fused)  ((u16)((fused) & 0xFFFF))
 #define EXTRACT_AVG_RT(fused)   ((u16)((fused) >> 16))
 #define PACK_DEFICIT_AVG(deficit, avg)  (((u32)(deficit) & 0xFFFF) | ((u32)(avg) << 16))
 
-/* Pure avg_runtime tier gates (µs) */
-#define TIER_GATE_T0   100   /* < 100µs  → T0 Critical: IRQ, input, audio */
-#define TIER_GATE_T1   2000  /* < 2000µs → T1 Interact: compositor, physics */
-#define TIER_GATE_T2   8000  /* < 8000µs → T2 Frame:    game render, encode */
-                             /* ≥ 8000µs → T3 Bulk:     compilation, bg */
+/* avg_runtime tier gates (µs) */
+#define TIER_GATE_T0   100
+#define TIER_GATE_T1   2000
+#define TIER_GATE_T2   8000
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * MEGA-MAILBOX: Per-CPU state (64 bytes = single cache line)
- * - Zero false sharing: each CPU writes only to its own entry
- * - Prefetch-accelerated reads: one prefetch loads entire CPU state
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* MEGA-MAILBOX */
+#define MBOX_TIER_MASK    0x03
+#define MBOX_GET_TIER(f)  ((f) & MBOX_TIER_MASK)
 
-/* Mailbox flags (packed in flags byte) */
-#define MBOX_TIER_MASK    0x03  /* Bits [1:0] = tier (0-3) */
-#define MBOX_VICTIM_BIT   0x08  /* Bit  [3]   = victim (preemptible) */
-#define MBOX_IDLE_BIT     0x10  /* Bit  [4]   = idle (no task running) */
-#define MBOX_WARM_BIT     0x20  /* Bit  [5]   = cache warm (recent run) */
-
-/* Mailbox flag accessors */
-#define MBOX_GET_TIER(f)   ((f) & MBOX_TIER_MASK)
-#define MBOX_IS_VICTIM(f)  ((f) & MBOX_VICTIM_BIT)
-#define MBOX_IS_IDLE(f)    ((f) & MBOX_IDLE_BIT)
-#define MBOX_IS_WARM(f)    ((f) & MBOX_WARM_BIT)
-
-/* 64-byte mega-mailbox entry (single cache line = optimal L1 efficiency)
- * Per-CPU write isolation: each CPU writes ONLY its own entry.
- * Only flags (tier) and dsq_hint (DVFS cache) are actively used.
- * Reserved space kept at 64B for future per-CPU-write features. */
 struct mega_mailbox_entry {
-    u8 flags;              /* [1:0]=tier — written by cake_tick */
-    u8 dsq_hint;           /* DVFS perf target cache — written by cake_tick */
-    u8 tick_counter;       /* 2-tick starvation gate — alternates rq lookup */
-    u8 __reserved[61];     /* Pad to 64B cache line, available for future use */
+    u8 flags;
+    /* dsq_hint: DVFS perf-target hysteresis cache (u8 = cpuperf_target >> 2).
+     * Name is historical (original use was DSQ selection hint, now removed);
+     * the field stores the last written DVFS target to skip redundant kfunc
+     * calls when the tier has not changed between ticks. */
+    u8 dsq_hint;
+    u8 tick_counter;
+    u8 __reserved[61];
 } __attribute__((aligned(64)));
 
-/* Statistics shared with userspace */
-struct cake_stats {
-    u64 nr_new_flow_dispatches;    /* Tasks dispatched from new-flow */
-    u64 nr_old_flow_dispatches;    /* Tasks dispatched from old-flow */
-    u64 nr_tier_dispatches[CAKE_TIER_MAX]; /* Per-tier dispatch counts */
-    u64 nr_starvation_preempts_tier[CAKE_TIER_MAX]; /* Per-tier starvation preempts */
-    u64 _pad[22];                  /* Pad to 256 bytes: (2+4+4+22)*8 = 256 */
+/* Statistics */
+struct imperator_stats {
+    u64 nr_new_flow_dispatches;
+    u64 nr_old_flow_dispatches;
+    u64 nr_tier_dispatches[CAKE_TIER_MAX];
+    u64 nr_starvation_preempts_tier[CAKE_TIER_MAX];
+    u64 nr_lock_holder_skips;
+    u64 nr_irq_wake_boosts;
+    u64 nr_waker_tier_boosts;
+    u64 _pad[19];
 } __attribute__((aligned(64)));
 
-/* Topology flags - enables zero-cost specialization (false = code path eliminated by verifier) */
+/* Defaults (Gaming profile) */
+#define CAKE_DEFAULT_QUANTUM_NS         (2 * 1000 * 1000)
+#define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)
+#define CAKE_DEFAULT_STARVATION_T0   3000000
+#define CAKE_DEFAULT_STARVATION_T1   8000000
+#define CAKE_DEFAULT_STARVATION_T2  40000000
+#define CAKE_DEFAULT_STARVATION_T3 100000000
+#define CAKE_DEFAULT_MULTIPLIER_T0  512
+#define CAKE_DEFAULT_MULTIPLIER_T1  1024
+#define CAKE_DEFAULT_MULTIPLIER_T2  2048
+#define CAKE_DEFAULT_MULTIPLIER_T3  4095
+#define CAKE_DEFAULT_WAIT_BUDGET_T0 100000
+#define CAKE_DEFAULT_WAIT_BUDGET_T1 2000000
+#define CAKE_DEFAULT_WAIT_BUDGET_T2 8000000
+#define CAKE_DEFAULT_WAIT_BUDGET_T3 0
 
-/* Default values (Gaming profile) */
-#define CAKE_DEFAULT_QUANTUM_NS         (2 * 1000 * 1000)   /* 2ms */
-#define CAKE_DEFAULT_NEW_FLOW_BONUS_NS  (8 * 1000 * 1000)   /* 8ms */
-#define CAKE_DEFAULT_STARVATION_NS      (100 * 1000 * 1000) /* 100ms */
-
-/* Default tier arrays (Gaming profile) — 4 tiers */
-
-/* Per-tier starvation thresholds (nanoseconds) */
-#define CAKE_DEFAULT_STARVATION_T0  3000000    /* Critical: 3ms */
-#define CAKE_DEFAULT_STARVATION_T1  8000000    /* Interact: 8ms */
-#define CAKE_DEFAULT_STARVATION_T2  40000000   /* Frame: 40ms */
-#define CAKE_DEFAULT_STARVATION_T3  100000000  /* Bulk: 100ms */
-
-/* Tier quantum multipliers (fixed-point, 1024 = 1.0x)
- * Power-of-4 progression: each tier gets 4x the quantum of the tier above.
- * T2 at 4ms lets 300fps+ render threads complete entire frames without preemption.
- * T0 at 0.5ms releases cores to game work faster (T0 runs <100µs anyway). */
-#define CAKE_DEFAULT_MULTIPLIER_T0  256    /* Critical: 0.25x = 0.5ms */
-#define CAKE_DEFAULT_MULTIPLIER_T1  1024   /* Interact: 1.0x  = 2.0ms */
-#define CAKE_DEFAULT_MULTIPLIER_T2  2048   /* Frame:    2.0x  = 4.0ms */
-#define CAKE_DEFAULT_MULTIPLIER_T3  4095   /* Bulk:     ~4.0x = 8.0ms (12-bit max = 4095) */
-
-/* Wait budget per tier (nanoseconds) */
-#define CAKE_DEFAULT_WAIT_BUDGET_T0 100000     /* Critical: 100µs */
-#define CAKE_DEFAULT_WAIT_BUDGET_T1 2000000    /* Interact: 2ms */
-#define CAKE_DEFAULT_WAIT_BUDGET_T2 8000000    /* Frame: 8ms */
-#define CAKE_DEFAULT_WAIT_BUDGET_T3 0          /* Bulk: no limit */
-
-/* Fused tier config - packs 4 params into 64-bit: [Mult:12][Quantum:16][Budget:16][Starve:20] */
+/* Fused tier config: [Mult:12][Quantum:16][Budget:16][Starve:20] */
 typedef u64 fused_config_t;
 
 #define CFG_SHIFT_MULTIPLIER  0
@@ -180,21 +207,17 @@ typedef u64 fused_config_t;
 #define CFG_MASK_BUDGET       0xFFFFULL
 #define CFG_MASK_STARVATION   0xFFFFFULL
 
-/* Extraction Macros (BPF Side) */
-/* Multiplier: bits 0-11. AND only. */
 #define UNPACK_MULTIPLIER(cfg)    ((cfg) & CFG_MASK_MULTIPLIER)
-/* Quantum: bits 12-27. SHR; AND; SHL. */
 #define UNPACK_QUANTUM_NS(cfg)    ((((cfg) >> CFG_SHIFT_QUANTUM) & CFG_MASK_QUANTUM) << 10)
-/* Budget: bits 28-43. SHR; AND; SHL. */
 #define UNPACK_BUDGET_NS(cfg)     ((((cfg) >> CFG_SHIFT_BUDGET) & CFG_MASK_BUDGET) << 10)
-/* Starvation: bits 44-63. SHR; SHL. (Mask redundant) */
 #define UNPACK_STARVATION_NS(cfg) (((cfg) >> CFG_SHIFT_STARVATION) << 10)
 
-/* Packing Macro (Userspace/Helper) */
-#define PACK_CONFIG(q_us, mult, budget_us, starv_us) \
+#define PACK_CONFIG(q_kns, mult, budget_kns, starv_kns) \
     ((((u64)(mult) & CFG_MASK_MULTIPLIER) << CFG_SHIFT_MULTIPLIER) | \
-     (((u64)(q_us) & CFG_MASK_QUANTUM) << CFG_SHIFT_QUANTUM) | \
-     (((u64)(budget_us) & CFG_MASK_BUDGET) << CFG_SHIFT_BUDGET) | \
-     (((u64)(starv_us) & CFG_MASK_STARVATION) << CFG_SHIFT_STARVATION))
+     (((u64)(q_kns) & CFG_MASK_QUANTUM) << CFG_SHIFT_QUANTUM) | \
+     (((u64)(budget_kns) & CFG_MASK_BUDGET) << CFG_SHIFT_BUDGET) | \
+     (((u64)(starv_kns) & CFG_MASK_STARVATION) << CFG_SHIFT_STARVATION))
+
+#define CAKE_FUTEX_OP_UNSET  0xFF
 
 #endif /* __CAKE_INTF_H */

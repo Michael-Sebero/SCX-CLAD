@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-// ETD for scx_cake - measures inter-core latency via CAS ping-pong (adapted from nviennot/core-to-core-latency)
+// ETD for scx_imperator - measures inter-core latency via CAS ping-pong (adapted from nviennot/core-to-core-latency)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use quanta::Clock;
 
 /// Cache-line padded atomic to avoid false sharing
@@ -27,6 +27,11 @@ impl PaddedAtomicBool {
 struct SharedState {
     barrier: Barrier,
     flag: PaddedAtomicBool,
+    // FIX (deadlock): abort signals that one thread failed affinity pinning.
+    // Both threads store true before barrier.wait() on failure; both check
+    // after barrier.wait() and exit cleanly.  Without this, the failing thread
+    // returned before barrier.wait(), permanently blocking the other thread.
+    abort: AtomicBool,
 }
 
 const PING: bool = false;
@@ -58,11 +63,35 @@ impl Default for EtdConfig {
     }
 }
 
+// FIX (#13): Helper that sets RT priority and warns (rather than silently ignoring) on failure.
+// On non-root execution sched_setscheduler returns EPERM — measurements continue but
+// with potential scheduler jitter that may inflate latency values.
+fn try_set_realtime_priority() {
+    unsafe {
+        let param = libc::sched_param { sched_priority: 99 };
+        let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+        if ret != 0 {
+            warn!(
+                "ETD: Failed to set RT priority ({}). Run as root for accurate measurements.",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+fn reset_normal_priority() {
+    unsafe {
+        let param = libc::sched_param { sched_priority: 0 };
+        libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+    }
+}
+
 /// Measure round-trip latency between two CPUs using CAS ping-pong. Returns per-sample latencies (ns).
 fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f64>> {
     let state = Arc::new(SharedState {
         barrier: Barrier::new(2),
         flag: PaddedAtomicBool::new(PING),
+        abort: AtomicBool::new(false),
     });
 
     let clock = Arc::new(Clock::new());
@@ -78,17 +107,25 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
         // PONG thread: waits for PING, sets to PONG
         let pong = s.spawn(move |_| {
             let core_id = core_affinity::CoreId { id: cpu_b };
+
+            // FIX (deadlock): Signal abort BEFORE barrier.wait() so the ping
+            // thread is never permanently blocked waiting for a pong that exited.
+            // Previously: affinity check → early return (before barrier) → ping
+            // blocks at barrier.wait() forever.
             if !core_affinity::set_for_current(core_id) {
+                state_pong.abort.store(true, Ordering::Release);
+            }
+
+            // Unconditional barrier participation — both threads must reach this.
+            state_pong.barrier.wait();
+
+            // If either side failed, bail out cleanly.
+            if state_pong.abort.load(Ordering::Acquire) {
                 return;
             }
 
-            // Set real-time priority to minimize preemption jitter
-            unsafe {
-                let param = libc::sched_param { sched_priority: 99 };
-                libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
-            }
-
-            state_pong.barrier.wait();
+            // FIX (#13): Warn on RT priority failure instead of silently ignoring
+            try_set_realtime_priority();
 
             // Warmup phase (not timed, stabilizes boost clocks)
             for _ in 0..warmup_trips {
@@ -114,29 +151,32 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
                 }
             }
 
-            // Reset to normal priority before thread exit
-            unsafe {
-                let param = libc::sched_param { sched_priority: 0 };
-                libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
-            }
+            reset_normal_priority();
         });
 
         // PING thread: sets to PING, waits for PONG, measures time
         let ping = s.spawn(move |_| {
             let core_id = core_affinity::CoreId { id: cpu_a };
+
+            // FIX (deadlock): Signal abort BEFORE barrier.wait() so the pong
+            // thread is never permanently blocked if ping's affinity fails.
             if !core_affinity::set_for_current(core_id) {
+                state_ping.abort.store(true, Ordering::Release);
+            }
+
+            // Unconditional barrier participation — both threads must reach this.
+            state_ping.barrier.wait();
+
+            // If either side failed (checked after barrier so both see the flag),
+            // bail out without entering the measurement loops.
+            if state_ping.abort.load(Ordering::Acquire) {
                 return None;
             }
 
-            // Set real-time priority to minimize preemption jitter
-            unsafe {
-                let param = libc::sched_param { sched_priority: 99 };
-                libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
-            }
+            // FIX (#13): Warn on RT priority failure instead of silently ignoring
+            try_set_realtime_priority();
 
             let mut results = Vec::with_capacity(num_samples);
-
-            state_ping.barrier.wait();
 
             // Warmup phase (not timed, stabilizes boost clocks)
             for _ in 0..warmup_trips {
@@ -171,11 +211,7 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
                 results.push(duration_ns / (num_round_trips as f64 * 2.0));
             }
 
-            // Reset to normal priority before thread exit
-            unsafe {
-                let param = libc::sched_param { sched_priority: 0 };
-                libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
-            }
+            reset_normal_priority();
 
             Some(results)
         });
@@ -216,44 +252,61 @@ where
             const MAX_RETRIES: u32 = 3;
 
             while let Some(samples) = measure_pair(cpu_a, cpu_b, config) {
-                if !samples.is_empty() {
-                    // Calculate mean and standard deviation
-                    let n = samples.len() as f64;
-                    let mean = samples.iter().sum::<f64>() / n;
-                    let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-                    let stddev = variance.sqrt();
+                let n = samples.len() as f64;
+                let mean = samples.iter().sum::<f64>() / n;
+                let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+                let stddev = variance.sqrt();
 
-                    // Check if variance is acceptable (no IRQ interference)
-                    if stddev <= config.max_stddev || retry_count >= MAX_RETRIES {
-                        // Use median for final value (more robust than mean)
-                        let mut sorted = samples;
-                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        let median = sorted[sorted.len() / 2];
+                // Check if variance is acceptable (no IRQ interference)
+                if stddev <= config.max_stddev || retry_count >= MAX_RETRIES {
+                    // Use median for final value (more robust than mean)
+                    let mut sorted = samples;
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let median = sorted[sorted.len() / 2];
 
-                        matrix[cpu_a][cpu_b] = median;
-                        matrix[cpu_b][cpu_a] = median;
+                    matrix[cpu_a][cpu_b] = median;
+                    matrix[cpu_b][cpu_a] = median;
 
-                        if stddev > config.max_stddev {
-                            debug!(
-                                "ETD: CPU {}<->{} stddev={:.1}ns (exceeded threshold after {} retries)",
-                                cpu_a, cpu_b, stddev, retry_count
-                            );
-                        }
-
-                        // Report progress (not complete yet)
-                        progress_callback(current_pair, total_pairs, false);
-                        break;
-                    } else {
-                        retry_count += 1;
+                    if stddev > config.max_stddev {
                         debug!(
-                            "ETD: CPU {}<->{} stddev={:.1}ns > {:.1}ns, retrying ({}/{})",
-                            cpu_a, cpu_b, stddev, config.max_stddev, retry_count, MAX_RETRIES
+                            "ETD: CPU {}<->{} stddev={:.1}ns (exceeded threshold after {} retries)",
+                            cpu_a, cpu_b, stddev, retry_count
                         );
                     }
+
+                    break;
                 } else {
-                    break; // Empty samples, skip
+                    retry_count += 1;
+                    debug!(
+                        "ETD: CPU {}<->{} stddev={:.1}ns > {:.1}ns, retrying ({}/{})",
+                        cpu_a, cpu_b, stddev, config.max_stddev, retry_count, MAX_RETRIES
+                    );
                 }
             }
+
+            // FIX (#1): When measure_pair() returns None (affinity pinning denied),
+            // the while-let body never executes and the matrix entries stay at 0.0.
+            // A 0.0 entry is the smallest possible latency value and will always win
+            // the ETD work-stealing comparison, permanently routing steals to the
+            // failed pair regardless of actual topology distance.  Fill with a large
+            // sentinel (500 ns covers worst-case cross-NUMA on Threadripper/EPYC) so
+            // the pair is treated as expensive rather than free.
+            //
+            // FIX (#5): progress_callback was only called inside the while-let body
+            // (success path).  An affinity failure silently skips the callback,
+            // leaving the TUI progress counter stuck.  Move the call here so it fires
+            // unconditionally after every pair — whether the measurement succeeded,
+            // hit max retries, or the threads could not be pinned.
+            if matrix[cpu_a][cpu_b] == 0.0 {
+                const ETD_FALLBACK_NS: f64 = 500.0;
+                matrix[cpu_a][cpu_b] = ETD_FALLBACK_NS;
+                matrix[cpu_b][cpu_a] = ETD_FALLBACK_NS;
+                warn!(
+                    "ETD: CPU {}<->{} affinity/measurement failed, using fallback {:.0}ns",
+                    cpu_a, cpu_b, ETD_FALLBACK_NS
+                );
+            }
+            progress_callback(current_pair, total_pairs, false);
         }
     }
 

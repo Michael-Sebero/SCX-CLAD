@@ -31,7 +31,6 @@ pub struct TopologyInfo {
     pub cpu_is_big: [u8; MAX_CPUS],
     pub cpu_core_id: [u8; MAX_CPUS],
     pub cpu_thread_bit: [u8; MAX_CPUS],
-    pub cpu_dsq_id: [u32; MAX_CPUS],
     /// Pre-computed 64-bit mask of all CPUs in a physical core
     pub core_cpu_mask: [u64; 32],
     /// Bitmask requirement for a core to be "fully idle" (e.g. 0x3 for dual SMT)
@@ -39,8 +38,11 @@ pub struct TopologyInfo {
     pub llc_cpu_mask: [u64; MAX_LLCS],
     pub big_cpu_mask: u64,
 
-    // Info
-    pub cpus_per_ccd: u32,
+    // FIX (#12): Field name and doc clarified — this counts logical CPUs (threads)
+    // per CCD, NOT physical cores. With SMT enabled on a 6-core CCD this will be
+    // 12, not 6. Renamed inner variable from `core_count` to `thread_count` at
+    // the computation site to prevent future confusion.
+    pub threads_per_ccd: u32,
 }
 
 pub fn detect() -> Result<TopologyInfo> {
@@ -76,15 +78,14 @@ pub fn detect() -> Result<TopologyInfo> {
         smt_enabled: topo.smt_enabled,
         cpu_sibling_map,
         cpu_llc_id: [0; MAX_CPUS],
-        cpu_is_big: [1; MAX_CPUS], // Default to 1 (Big) to be safe
+        cpu_is_big: [0; MAX_CPUS], // Reset and re-populated by P/E-core detection below
         cpu_core_id: [0; MAX_CPUS],
         cpu_thread_bit: [0; MAX_CPUS],
-        cpu_dsq_id: [0; MAX_CPUS],
         core_cpu_mask: [0; 32],
         core_thread_mask: [0; 32],
         llc_cpu_mask: [0; MAX_LLCS],
         big_cpu_mask: 0,
-        cpus_per_ccd: 0,
+        threads_per_ccd: 0,
     };
 
     // 1. Map LLCs
@@ -98,29 +99,37 @@ pub fn detect() -> Result<TopologyInfo> {
         }
 
         let mut mask = 0u64;
-        let mut core_count = 0;
+        // FIX (#12): Renamed from `core_count` to `thread_count` — all_cpus iterates
+        // logical CPUs (hardware threads), not physical cores. With 2-way SMT the count
+        // will be 2× the physical core count. Callers needing core count should divide
+        // by the SMT degree (e.g., threads_per_ccd / 2 for dual-SMT).
+        let mut thread_count = 0u32;
 
         for cpu_id in llc.all_cpus.keys() {
             let cpu = *cpu_id;
             if cpu < MAX_CPUS {
                 info.cpu_llc_id[cpu] = llc_idx as u8;
                 mask |= 1u64 << cpu;
-                core_count += 1;
+                thread_count += 1;
             }
         }
 
         info.llc_cpu_mask[llc_idx] = mask;
-        if info.cpus_per_ccd == 0 {
-            info.cpus_per_ccd = core_count;
-        } // Estimate
+        // FIX (#6): Use max-reduce rather than first-seen assignment.
+        // On asymmetric CCDs (e.g. Ryzen 7000X3D, one V-Cache CCD vs one
+        // throttled/partial CCD) the first LLC enumerated by the BTreeMap
+        // may have fewer online CPUs than the others.  Taking the maximum
+        // ensures threads_per_ccd reflects the largest CCD and never
+        // underestimates the fill threshold used by the BPF work-stealer.
+        // For symmetric systems (all CCDs equal) the result is identical.
+        if thread_count > info.threads_per_ccd {
+            info.threads_per_ccd = thread_count;
+        }
 
         llc_idx += 1;
     }
 
     // 2. Identify P-cores vs E-cores
-    // Reset defaults to recalculate based on CoreType
-    info.cpu_is_big = [0; MAX_CPUS];
-    info.big_cpu_mask = 0;
 
     let mut p_cores_found = 0;
     let mut e_cores_found = 0;
@@ -158,8 +167,6 @@ pub fn detect() -> Result<TopologyInfo> {
                 info.cpu_is_big[cpu] = is_big;
                 info.cpu_core_id[cpu] = core_id as u8;
                 info.cpu_thread_bit[cpu] = 1 << thread_idx;
-                info.cpu_dsq_id[cpu] = 1000 /* CAKE_DSQ_LC_BASE */ + cpu as u32;
-
                 if core_id < 32 {
                     info.core_cpu_mask[core_id] |= 1u64 << cpu;
                 }
@@ -175,13 +182,6 @@ pub fn detect() -> Result<TopologyInfo> {
     // Update hybrid flag
     if p_cores_found > 0 && e_cores_found > 0 {
         info.has_hybrid_cores = true;
-    } else {
-        info.has_hybrid_cores = false;
-        // If not hybrid, ensure all marked as Big for consistency (though mask handles it)
-        if p_cores_found == 0 && e_cores_found > 0 {
-            // Weird case: All E-cores? Treat as "Big" relative to nothing.
-            // But we keep as is.
-        }
     }
 
     // Log detected topology (debug level - use RUST_LOG=debug to see)

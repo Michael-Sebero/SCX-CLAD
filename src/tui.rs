@@ -22,13 +22,13 @@ use ratatui::{
 };
 use tachyonfx::{fx, EffectManager};
 
-use crate::bpf_skel::types::cake_stats;
+use crate::bpf_skel::types::imperator_stats;
 use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
 use crate::topology::TopologyInfo;
 
-fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
-    let mut total: cake_stats = Default::default();
+fn aggregate_stats(skel: &BpfSkel) -> imperator_stats {
+    let mut total: imperator_stats = Default::default();
 
     if let Some(bss) = &skel.maps.bss_data {
         for s in &bss.global_stats {
@@ -40,6 +40,11 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
                 total.nr_tier_dispatches[i] += s.nr_tier_dispatches[i];
                 total.nr_starvation_preempts_tier[i] += s.nr_starvation_preempts_tier[i];
             }
+
+            // New LAVD-derived feature counters
+            total.nr_lock_holder_skips += s.nr_lock_holder_skips;
+            total.nr_irq_wake_boosts += s.nr_irq_wake_boosts;
+            total.nr_waker_tier_boosts += s.nr_waker_tier_boosts;
         }
     }
 
@@ -51,6 +56,19 @@ pub struct TuiApp {
     start_time: Instant,
     status_message: Option<(String, Instant)>,
     topology: TopologyInfo,
+    /// Snapshot taken at the previous tick — used to compute per-second rates.
+    prev_stats: imperator_stats,
+    /// Wall-clock time of the previous snapshot, used for delta-time divisor.
+    prev_tick: Instant,
+}
+
+/// Per-second event rates derived from two consecutive stats snapshots.
+/// Values are f64 so fractional rates display correctly at slow intervals.
+pub struct StatsRates {
+    /// Per-tier starvation preemptions per second.
+    pub starve_per_sec: [f64; 4],
+    /// Lock-holder starvation skips per second (system-wide).
+    pub lock_skip_per_sec: f64,
 }
 
 impl TuiApp {
@@ -59,7 +77,50 @@ impl TuiApp {
             start_time: Instant::now(),
             status_message: None,
             topology,
+            prev_stats: imperator_stats::default(),
+            prev_tick: Instant::now(),
         }
+    }
+
+    /// Compute per-second rates relative to the stored previous snapshot, then
+    /// update the snapshot.  Called once per TUI refresh with the latest aggregated
+    /// stats so that the rates always reflect the most recent `interval_secs` window.
+    ///
+    /// Handles counter resets (the `[r]` key zeroes BSS): when a new value is less
+    /// than the previous, the delta is clamped to zero for that field rather than
+    /// producing a large negative or wrap-around spike.
+    pub fn tick_stats(&mut self, current: &imperator_stats) -> StatsRates {
+        let elapsed_secs = self.prev_tick.elapsed().as_secs_f64().max(0.001);
+
+        let delta = |cur: u64, prev: u64| -> f64 {
+            (cur.saturating_sub(prev)) as f64 / elapsed_secs
+        };
+
+        let mut starve_per_sec = [0.0f64; 4];
+        for i in 0..4 {
+            starve_per_sec[i] = delta(
+                current.nr_starvation_preempts_tier[i],
+                self.prev_stats.nr_starvation_preempts_tier[i],
+            );
+        }
+        let lock_skip_per_sec = delta(
+            current.nr_lock_holder_skips,
+            self.prev_stats.nr_lock_holder_skips,
+        );
+
+        // Advance snapshot
+        self.prev_stats = *current;
+        self.prev_tick  = Instant::now();
+
+        StatsRates { starve_per_sec, lock_skip_per_sec }
+    }
+
+    /// Invalidate the previous-stats snapshot so the next tick_stats() call
+    /// produces a fresh window rather than a misleading spike.  Called when
+    /// the user resets BSS counters with `[r]`.
+    pub fn invalidate_rates(&mut self) {
+        self.prev_stats = imperator_stats::default();
+        self.prev_tick  = Instant::now();
     }
 
     /// Format uptime as "Xm Ys" or "Xh Ym"
@@ -386,16 +447,20 @@ fn render_startup_widgets(
     };
     let author_typed = &author_full[..chars_to_show];
 
+    // FIX (#16): Use Cargo package version rather than a hardcoded literal so the
+    // TUI always reflects the current release without a manual string update.
+    let version_str = concat!("v", env!("CARGO_PKG_VERSION"));
+
     let title = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(" 🍰 ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                "scx_cake ",
+                "scx_imperator ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("v1.02", Style::default().fg(Color::White)),
+            Span::styled(version_str, Style::default().fg(Color::White)),
             Span::styled(
                 " │ Gaming Oriented Scheduler",
                 Style::default()
@@ -494,7 +559,7 @@ fn render_startup_widgets(
     topology_grid.render(left_layout[2], buffer);
 
     // --- Empirical Fabric (The Heatmap) ---
-    let heatmap = LatencyHeatmap::new(params.latency_matrix, params.topology);
+    let heatmap = LatencyHeatmap::new(params.latency_matrix);
     heatmap.render(dashboard_layout[1], buffer);
 
     // --- Numerical Truth (Raw Data) ---
@@ -535,6 +600,7 @@ fn build_cpu_topology_grid_compact(topology: &TopologyInfo) -> Paragraph<'static
     lines.push(Line::from(""));
 
     let mut current_line = Vec::new();
+
     for cpu in 0..nr_cpus {
         // Dot indicator for core type
         let symbol = if topology.cpu_is_big.get(cpu).copied().unwrap_or(0) != 0 {
@@ -581,15 +647,34 @@ fn build_cpu_topology_grid_compact(topology: &TopologyInfo) -> Paragraph<'static
     )
 }
 
+// FIX (#8): Map a measured latency value to a heat color.
+// When calibration data is available (max_ns > 0), colors scale from
+// cool (low latency, near topology minimum) to hot (high latency).
+// Falls back to topology-based colors when the matrix is all zeros
+// (calibration not yet complete).
+fn latency_heat_color(latency_ns: f64, min_ns: f64, max_ns: f64) -> Color {
+    if max_ns <= 0.0 || (max_ns - min_ns) < 1.0 {
+        // No calibration data — neutral gray
+        return Color::Rgb(80, 80, 80);
+    }
+    // Clamp ratio to [0, 1]
+    let ratio = ((latency_ns - min_ns) / (max_ns - min_ns)).clamp(0.0, 1.0);
+
+    // Cool-to-hot gradient: teal → cyan → yellow → amber
+    let r = (ratio * 255.0) as u8;
+    let g = ((1.0 - ratio * 0.3) * 200.0) as u8;
+    let b = ((1.0 - ratio).powi(2) * 220.0) as u8;
+    Color::Rgb(r, g, b)
+}
+
 /// Custom Widget for high-density Latency Heatmap
 struct LatencyHeatmap<'a> {
     matrix: &'a [Vec<f64>],
-    topology: &'a TopologyInfo,
 }
 
 impl<'a> LatencyHeatmap<'a> {
-    fn new(matrix: &'a [Vec<f64>], topology: &'a TopologyInfo) -> Self {
-        Self { matrix, topology }
+    fn new(matrix: &'a [Vec<f64>]) -> Self {
+        Self { matrix }
     }
 }
 
@@ -610,21 +695,52 @@ impl<'a> Widget for LatencyHeatmap<'a> {
             return;
         }
 
-        // Header for Target CPUs (X-axis)
+        // FIX (#8): Compute global min/max of non-zero, non-diagonal latency values
+        // so the heat gradient spans the actual measured range rather than being
+        // a static topology diagram that ignores the ETD measurements entirely.
+        let mut min_ns = f64::MAX;
+        let mut max_ns = 0.0f64;
+        for i in 0..nr_cpus {
+            for j in 0..nr_cpus {
+                if i != j {
+                    let v = self.matrix[i][j];
+                    if v > 0.0 {
+                        min_ns = min_ns.min(v);
+                        max_ns = max_ns.max(v);
+                    }
+                }
+            }
+        }
+        // If no data yet (all zeros), min_ns stays MAX — latency_heat_color handles this
+        if min_ns == f64::MAX {
+            min_ns = 0.0;
+        }
+
+        // FIX (audit): Two-row header so CPUs ≥10 are unambiguous.
+        // Previously format!("{:1}", j % 10) made CPU 0 and CPU 10 display
+        // the same label "0", etc. Row 0 shows the tens digit (blank for <10),
+        // Row 1 shows the ones digit.
         for j in 0..nr_cpus {
             let x = inner_area.x + 6 + (j as u16 * 2);
             if x < inner_area.right() {
+                let tens = j / 10;
                 buf.set_string(
                     x,
                     inner_area.y,
-                    format!("{:1}", j % 10),
+                    if tens > 0 { format!("{}", tens) } else { " ".to_string() },
+                    Style::default().fg(Color::Cyan).dim(),
+                );
+                buf.set_string(
+                    x,
+                    inner_area.y + 1,
+                    format!("{}", j % 10),
                     Style::default().fg(Color::Cyan).dim(),
                 );
             }
         }
 
         for i in 0..nr_cpus {
-            let y = inner_area.y + 1 + i as u16;
+            let y = inner_area.y + 2 + i as u16;  // +2 for two-row header
             if y >= inner_area.bottom() {
                 break;
             }
@@ -644,17 +760,15 @@ impl<'a> Widget for LatencyHeatmap<'a> {
                 }
 
                 let is_self = i == j;
-                let is_smt = self.topology.cpu_sibling_map[i] as usize == j;
-                let same_ccd = self.topology.cpu_llc_id[i] == self.topology.cpu_llc_id[j];
-
                 let style = if is_self {
+                    // Diagonal — self-latency is meaningless, render dark
                     Style::default().fg(Color::Rgb(40, 40, 40))
-                } else if is_smt {
-                    Style::default().fg(Color::Rgb(0, 255, 150)) // Turquoise
-                } else if same_ccd {
-                    Style::default().fg(Color::Rgb(0, 200, 255)) // Cyan
                 } else {
-                    Style::default().fg(Color::Rgb(255, 180, 0)) // Amber
+                    // FIX (#8): Color driven by measured latency value, not topology category.
+                    // When calibration hasn't run yet (matrix all zeros) the gradient falls
+                    // back to a uniform gray via latency_heat_color's max_ns==0 guard.
+                    let cell_color = latency_heat_color(self.matrix[i][j], min_ns, max_ns);
+                    Style::default().fg(cell_color)
                 };
 
                 buf.set_string(x, y, "█", style);
@@ -662,28 +776,31 @@ impl<'a> Widget for LatencyHeatmap<'a> {
             }
         }
 
-        // Legend at bottom
+        // Legend at bottom showing latency range
         let legend_y = inner_area.bottom().saturating_sub(1);
         let legend_x = inner_area.x + 1;
-        if legend_y > inner_area.y + nr_cpus as u16 {
-            buf.set_string(
-                legend_x,
-                legend_y,
-                "█ SMT",
-                Style::default().fg(Color::Rgb(0, 255, 150)),
-            );
-            buf.set_string(
-                legend_x + 9,
-                legend_y,
-                "█ Same CCD",
-                Style::default().fg(Color::Rgb(0, 200, 255)),
-            );
-            buf.set_string(
-                legend_x + 22,
-                legend_y,
-                "█ Cross-CCD",
-                Style::default().fg(Color::Rgb(255, 180, 0)),
-            );
+        if legend_y > inner_area.y + nr_cpus as u16 + 1 {  // +1 for two-row header
+            if max_ns > 0.0 {
+                buf.set_string(
+                    legend_x,
+                    legend_y,
+                    format!("min:{:.0}ns", min_ns),
+                    Style::default().fg(Color::Rgb(0, 200, 200)),
+                );
+                buf.set_string(
+                    legend_x + 14,
+                    legend_y,
+                    format!("max:{:.0}ns", max_ns),
+                    Style::default().fg(Color::Rgb(255, 180, 0)),
+                );
+            } else {
+                buf.set_string(
+                    legend_x,
+                    legend_y,
+                    "Calibrating...",
+                    Style::default().fg(Color::DarkGray),
+                );
+            }
         }
     }
 }
@@ -771,7 +888,7 @@ impl<'a> Widget for LatencyTable<'a> {
 }
 
 /// Format stats as a copyable text string
-fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
+fn format_stats_for_clipboard(stats: &imperator_stats, uptime: &str) -> String {
     let total_dispatches = stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches;
     let new_pct = if total_dispatches > 0 {
         (stats.nr_new_flow_dispatches as f64 / total_dispatches as f64) * 100.0
@@ -781,7 +898,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
 
     let mut output = String::new();
     output.push_str(&format!(
-        "=== scx_cake Statistics (Uptime: {}) ===\n\n",
+        "=== scx_imperator Statistics (Uptime: {}) ===\n\n",
         uptime
     ));
     output.push_str(&format!(
@@ -789,8 +906,8 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
         total_dispatches, new_pct
     ));
 
-    output.push_str("Tier           Dispatches    StarvPreempt\n");
-    output.push_str("───────────────────────────────────────────\n");
+    output.push_str("Tier           Dispatches    StarvTotal   (Starve/s is live-only)\n");
+    output.push_str("──────────────────────────────────────────────────────────────────\n");
     for (i, name) in TIER_NAMES.iter().enumerate() {
         output.push_str(&format!(
             "{:12}   {:>10}    {:>12}\n",
@@ -798,11 +915,16 @@ fn format_stats_for_clipboard(stats: &cake_stats, uptime: &str) -> String {
         ));
     }
 
+    output.push_str("\nLAVD-derived feature counters:\n");
+    output.push_str(&format!("  Lock-holder starvation skips : {}\n", stats.nr_lock_holder_skips));
+    output.push_str(&format!("  IRQ-source wakeup T0 boosts  : {}\n", stats.nr_irq_wake_boosts));
+    output.push_str(&format!("  Waker tier inheritance boosts: {}\n", stats.nr_waker_tier_boosts));
+
     output
 }
 
 /// Draw the UI
-fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
+fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &imperator_stats, rates: &StatsRates) {
     let area = frame.area();
 
     // Create main layout: header, stats table, footer
@@ -854,7 +976,7 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     );
     let header = Paragraph::new(header_text).block(
         Block::default()
-            .title(" scx_cake Statistics ")
+            .title(" scx_imperator Statistics ")
             .title_style(
                 Style::default()
                     .fg(Color::Cyan)
@@ -866,7 +988,12 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     frame.render_widget(header, layout[0]);
 
     // --- Stats Table ---
-    let header_cells = ["Tier", "Dispatches", "StarvPreempt"].iter().map(|h| {
+    // FIX (gap/tui-rates): Added "Starve/s" column showing live per-tier starvation
+    // preemption rate.  This makes the starvation thresholds (3/8/40/100ms) observable
+    // in real time — a non-zero T0 Starve/s signals that audio/input tasks are being
+    // held past their threshold and the T0 gate should be tightened.  The cumulative
+    // "StarvTotal" column is preserved alongside it for session-level context.
+    let header_cells = ["Tier", "Dispatches", "StarvTotal", "Starve/s", "LockSkip", "IRQBoost", "WakerBoost"].iter().map(|h| {
         Cell::from(*h).style(
             Style::default()
                 .fg(Color::Yellow)
@@ -879,10 +1006,31 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
         .iter()
         .enumerate()
         .map(|(i, name)| {
+            // Format Starve/s: show "—" when rate is zero (quiet) to avoid noise,
+            // and highlight non-zero T0/T1 rates in red since they indicate latency
+            // threshold breaches that may be perceptible to the user.
+            let starve_rate = rates.starve_per_sec[i];
+            let starve_rate_cell = if starve_rate < 0.05 {
+                Cell::from("—").style(Style::default().fg(Color::DarkGray))
+            } else if i <= 1 {
+                // T0/T1 breach — highlight red: these are the latency-sensitive tiers
+                Cell::from(format!("{:.1}/s", starve_rate))
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from(format!("{:.1}/s", starve_rate))
+                    .style(Style::default().fg(Color::Yellow))
+            };
+
             let cells = vec![
                 Cell::from(*name).style(tier_style(i)),
                 Cell::from(format!("{}", stats.nr_tier_dispatches[i])),
                 Cell::from(format!("{}", stats.nr_starvation_preempts_tier[i])),
+                starve_rate_cell,
+                // Lock-holder skip and IRQ/waker boost counters are system-wide (not
+                // per-tier), so only show them on the T0 row to avoid duplication.
+                Cell::from(if i == 0 { format!("{}", stats.nr_lock_holder_skips) } else { String::new() }),
+                Cell::from(if i == 0 { format!("{}", stats.nr_irq_wake_boosts) } else { String::new() }),
+                Cell::from(if i == 0 { format!("{}", stats.nr_waker_tier_boosts) } else { String::new() }),
             ];
             Row::new(cells).height(1)
         })
@@ -893,7 +1041,11 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
         [
             Constraint::Length(12),
             Constraint::Length(12),
-            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
         ],
     )
     .header(header_row)
@@ -906,11 +1058,23 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &cake_stats) {
     frame.render_widget(table, layout[1]);
 
     // --- Summary ---
+    // Show lock_skip/s alongside total so the cap behaviour (Fix 2) is visible:
+    // persistent lock_skip/s > 0 after the cap fires indicates a task spending
+    // most of its time holding a futex — useful for diagnosing Wine/Proton stalls.
     let total_starvation: u64 = stats.nr_starvation_preempts_tier.iter().sum();
+    let lock_skip_rate_str = if rates.lock_skip_per_sec < 0.05 {
+        String::from("—")
+    } else {
+        format!("{:.1}/s", rates.lock_skip_per_sec)
+    };
     let summary_text = format!(
-        " Dispatches: {} | Starvation preempts: {}",
+        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} ({}) | IRQ boosts: {} | Waker boosts: {}",
         stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches,
-        total_starvation
+        total_starvation,
+        stats.nr_lock_holder_skips,
+        lock_skip_rate_str,
+        stats.nr_irq_wake_boosts,
+        stats.nr_waker_tier_boosts,
     );
 
     let summary = Paragraph::new(summary_text).block(
@@ -961,6 +1125,19 @@ pub fn run_tui(
     interval_secs: u64,
     topology: TopologyInfo,
 ) -> Result<()> {
+    // FIX (#6): Install a panic hook that restores the terminal before printing
+    // the panic message. Without this, any widget rendering panic leaves the
+    // terminal in raw mode with the cursor hidden — the user's shell becomes
+    // unusable until they run `reset`.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort — ignore errors; the panic message is more important
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        let _ = io::stdout().execute(Show);
+        original_hook(info);
+    }));
+
     let mut terminal = setup_terminal()?;
     let mut app = TuiApp::new(topology);
     let tick_rate = Duration::from_secs(interval_secs);
@@ -983,8 +1160,13 @@ pub fn run_tui(
         // Get current stats (aggregate from per-cpu BSS array)
         let stats = aggregate_stats(skel);
 
+        // FIX (gap/tui-rates): Compute per-second rates against the previous
+        // snapshot.  tick_stats() advances the snapshot on every call, so rates
+        // reflect exactly one `interval_secs` window rather than a session total.
+        let rates = app.tick_stats(&stats);
+
         // Draw UI
-        terminal.draw(|frame| draw_ui(frame, &app, &stats))?;
+        terminal.draw(|frame| draw_ui(frame, &app, &stats, &rates))?;
 
         // Handle events with timeout
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -1008,11 +1190,14 @@ pub fn run_tui(
                             }
                         }
                         KeyCode::Char('r') => {
-                            // Reset stats (clear the BSS array)
+                            // Reset stats (clear the BSS array) and invalidate the
+                            // rate snapshot so the next window starts clean rather
+                            // than producing a misleading negative-delta spike.
                             if let Some(bss) = &mut skel.maps.bss_data {
                                 for s in &mut bss.global_stats {
                                     *s = Default::default();
                                 }
+                                app.invalidate_rates();
                                 app.set_status("✓ Stats reset");
                             }
                         }

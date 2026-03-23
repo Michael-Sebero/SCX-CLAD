@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// scx_cake - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
+// scx_imperator - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
 
 mod calibrate;
 mod stats;
@@ -9,137 +9,96 @@ mod tui;
 use core::sync::atomic::Ordering;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use log::{info, warn};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
-// Include the generated interface bindings
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
-
-// Include the generated BPF skeleton
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
 }
 use bpf_skel::*;
 
-/// Scheduler profile presets
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
-    /// Ultra-low-latency for competitive esports (1ms quantum)
     Esports,
-    /// Optimized for older/lower-power hardware (4ms quantum)
     Legacy,
-    /// Low-latency profile optimized for gaming and interactive workloads
     Gaming,
-    /// Balanced profile for general desktop use (same as gaming for now)
     Default,
 }
 
 impl Profile {
-    /// Returns (quantum_us, new_flow_bonus_us, starvation_us)
     fn values(&self) -> (u64, u64, u64) {
         match self {
-            // Esports: Ultra-aggressive, 1ms quantum for maximum responsiveness
             Profile::Esports => (1000, 4000, 50000),
-            // Legacy: High efficiency, 4ms quantum to reduce overhead on older CPUs
-            Profile::Legacy => (4000, 12000, 200000),
-            // Gaming: Aggressive latency, 2ms quantum
-            Profile::Gaming => (2000, 8000, 100000),
-            // Default: Same as gaming for now
-            Profile::Default => (2000, 8000, 100000),
+            Profile::Legacy  => (4000, 12000, 200000),
+            Profile::Gaming  => (2000, 8000, 100000),
+            Profile::Default => Profile::Gaming.values(),
         }
     }
 
-    /// Per-tier starvation thresholds in nanoseconds (4 tiers + padding)
     fn starvation_threshold(&self) -> [u64; 8] {
         match self {
             Profile::Esports => [
-                1_500_000,  // T0 Critical: 1.5ms
-                4_000_000,  // T1 Interactive: 4ms
-                20_000_000, // T2 Frame: 20ms
-                50_000_000, // T3 Bulk: 50ms
-                50_000_000, 50_000_000, 50_000_000, 50_000_000, // Padding
+                1_500_000, 4_000_000, 20_000_000, 50_000_000,
+                50_000_000, 50_000_000, 50_000_000, 50_000_000,
             ],
             Profile::Legacy => [
-                6_000_000,   // T0 Critical: 6ms
-                16_000_000,  // T1 Interactive: 16ms
-                80_000_000,  // T2 Frame: 80ms
-                200_000_000, // T3 Bulk: 200ms
-                200_000_000,
-                200_000_000,
-                200_000_000,
-                200_000_000, // Padding
+                6_000_000, 16_000_000, 80_000_000, 200_000_000,
+                200_000_000, 200_000_000, 200_000_000, 200_000_000,
             ],
             Profile::Gaming | Profile::Default => [
-                3_000_000,   // T0 Critical: 3ms
-                8_000_000,   // T1 Interactive: 8ms
-                40_000_000,  // T2 Frame: 40ms
-                100_000_000, // T3 Bulk: 100ms
-                100_000_000,
-                100_000_000,
-                100_000_000,
-                100_000_000, // Padding
+                3_000_000, 8_000_000, 40_000_000, 100_000_000,
+                100_000_000, 100_000_000, 100_000_000, 100_000_000,
             ],
         }
     }
 
-    /// Tier quantum multipliers (fixed-point, 1024 = 1.0x) — 4 tiers + padding
     fn tier_multiplier(&self) -> [u32; 8] {
         match self {
-            Profile::Esports | Profile::Legacy | Profile::Gaming | Profile::Default => [
-                768,  // T0 Critical: 0.75x
-                1024, // T1 Interactive: 1.0x
-                1229, // T2 Frame: 1.2x
-                1434, // T3 Bulk: 1.4x
-                1434, 1434, 1434, 1434, // Padding
-            ],
+            Profile::Esports => [256, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
+            Profile::Gaming | Profile::Default => [512, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
+            Profile::Legacy => [768, 1024, 1536, 2048, 2048, 2048, 2048, 2048],
         }
     }
 
-    /// Wait budget per tier in nanoseconds — 4 tiers + padding
     fn wait_budget(&self) -> [u64; 8] {
         match self {
-            Profile::Esports => [
-                50_000,    // T0 Critical: 50µs
-                1_000_000, // T1 Interactive: 1ms
-                4_000_000, // T2 Frame: 4ms
-                0,         // T3 Bulk: no limit
-                0, 0, 0, 0, // Padding
-            ],
-            Profile::Legacy => [
-                200_000,    // T0 Critical: 200µs
-                4_000_000,  // T1 Interactive: 4ms
-                16_000_000, // T2 Frame: 16ms
-                0,          // T3 Bulk: no limit
-                0, 0, 0, 0, // Padding
-            ],
-            Profile::Gaming | Profile::Default => [
-                100_000,   // T0 Critical: 100µs
-                2_000_000, // T1 Interactive: 2ms
-                8_000_000, // T2 Frame: 8ms
-                0,         // T3 Bulk: no limit
-                0, 0, 0, 0, // Padding
-            ],
+            Profile::Esports => [50_000, 1_000_000, 4_000_000, 0, 0, 0, 0, 0],
+            Profile::Legacy  => [200_000, 4_000_000, 16_000_000, 0, 0, 0, 0, 0],
+            Profile::Gaming | Profile::Default => [100_000, 2_000_000, 8_000_000, 0, 0, 0, 0, 0],
         }
     }
 
-    /// Consolidated tier config - packs quantum/multiplier/budget/starvation into 64-bit per tier.
-    fn tier_configs(&self, quantum_us: u64) -> [u64; 8] {
-        let starvation = self.starvation_threshold();
+    fn tier_configs(&self, quantum_us: u64, starvation_override: Option<u64>) -> [u64; 8] {
+        let base_starvation = self.starvation_threshold();
         let multiplier = self.tier_multiplier();
         let budget = self.wait_budget();
 
+        let starvation: [u64; 8] = if let Some(cli_us) = starvation_override {
+            let cli_ns = cli_us * 1000;
+            let default_t3 = base_starvation[3];
+            if default_t3 > 0 {
+                base_starvation.map(|s| s * cli_ns / default_t3)
+            } else {
+                base_starvation
+            }
+        } else {
+            base_starvation
+        };
+
         let mut configs = [0u64; 8];
         for i in 0..8 {
+            let quantum_kns = (quantum_us * 1000) >> 10;
             configs[i] = (multiplier[i] as u64 & 0xFFF)
-                | ((quantum_us & 0xFFFF) << 12)
+                | ((quantum_kns & 0xFFFF) << 12)
                 | (((budget[i] >> 10) & 0xFFFF) << 28)
                 | (((starvation[i] >> 10) & 0xFFFFF) << 44);
         }
@@ -147,102 +106,31 @@ impl Profile {
     }
 }
 
-/// 🍰 scx_cake: A sched_ext scheduler applying CAKE bufferbloat concepts
-///
-/// This scheduler adapts CAKE's DRR++ (Deficit Round Robin++) algorithm
-/// for CPU scheduling, providing low-latency scheduling for gaming and
-/// interactive workloads while maintaining fairness.
-///
-/// PROFILES set all tuning parameters at once. Individual options override profile defaults.
+/// 🍰 scx_imperator: A sched_ext scheduler applying CAKE bufferbloat concepts
 ///
 /// 4-TIER SYSTEM (classified by avg_runtime):
 ///   T0 Critical  (<100µs): IRQ, input, audio, network
 ///   T1 Interact  (<2ms):   compositor, physics, AI
 ///   T2 Frame     (<8ms):   game render, encoding
 ///   T3 Bulk      (≥8ms):   compilation, background
-///
-/// EXAMPLES:
-///   scx_cake                          # Run with gaming profile (default)
-///   scx_cake -p esports               # Ultra-low-latency for competitive play
-///   scx_cake --quantum 1500           # Gaming profile with custom quantum
-///   scx_cake -v                       # Run with live TUI stats display
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "🍰 A sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling",
-    verbatim_doc_comment
-)]
+#[command(author, version, about = "🍰 scx_imperator scheduler", verbatim_doc_comment)]
 struct Args {
-    /// Scheduler profile preset.
-    ///
-    /// Profiles configure all tier thresholds, quantum multipliers, and wait budgets.
-    /// Individual CLI options (--quantum, etc.) override profile values.
-    ///
-    /// ESPORTS: Ultra-low-latency for competitive gaming.
-    ///   - Quantum: 1000µs, Starvation: 50ms
-    ///
-    /// LEGACY: Optimized for older/lower-power hardware.
-    ///   - Quantum: 4000µs, Starvation: 200ms
-    ///
-    /// GAMING: Optimized for low-latency gaming and interactive workloads.
-    ///   - Quantum: 2000µs, Starvation: 100ms
-    ///
-    /// DEFAULT: Balanced profile for general desktop use.
-    ///   - Currently same as gaming; will diverge in future versions
-    #[arg(long, short, value_enum, default_value_t = Profile::Gaming, verbatim_doc_comment)]
+    #[arg(long, short, value_enum, default_value_t = Profile::Gaming)]
     profile: Profile,
-
-    /// Base scheduling time slice in MICROSECONDS [default: 2000].
-    ///
-    /// How long a task runs before potentially yielding.
-    ///
-    /// Smaller quantum = more responsive but higher overhead.
-    /// Esports: 1000µs | Gaming: 2000µs | Legacy: 4000µs
-    /// Recommended range: 1000-8000µs
-    #[arg(long, verbatim_doc_comment)]
+    #[arg(long)]
     quantum: Option<u64>,
-
-    /// Bonus time for newly woken tasks in MICROSECONDS [default: 8000].
-    ///
-    /// Tasks waking from sleep get this extra time added to their deficit,
-    /// allowing them to run longer on first dispatch. Helps bursty workloads.
-    ///
-    /// Esports: 4000µs | Gaming: 8000µs
-    /// Recommended range: 4000-16000µs
-    #[arg(long, verbatim_doc_comment)]
+    #[arg(long)]
     new_flow_bonus: Option<u64>,
-
-    /// Max run time before forced preemption in MICROSECONDS [default: 100000].
-    ///
-    /// Safety limit: tasks running longer than this are forcibly preempted.
-    /// Prevents any single task from monopolizing the CPU.
-    ///
-    /// Esports: 50000µs (50ms) | Gaming: 100000µs (100ms) | Legacy: 200000µs (200ms)
-    /// Recommended range: 50000-200000µs
-    #[arg(long, verbatim_doc_comment)]
+    #[arg(long)]
     starvation: Option<u64>,
-
-    /// Enable live TUI (Terminal User Interface) with real-time statistics.
-    ///
-    /// Shows dispatch counts per tier, tier transitions,
-    /// wait time stats, and system topology information.
-    /// Press 'q' to exit TUI mode.
-    #[arg(long, short, verbatim_doc_comment)]
+    #[arg(long, short)]
     verbose: bool,
-
-    /// Statistics refresh interval in SECONDS (only with --verbose).
-    ///
-    /// How often the TUI updates. Lower values = more responsive but
-    /// higher overhead. Has no effect without --verbose.
-    ///
-    /// Default: 1 second
-    #[arg(long, default_value_t = 1, verbatim_doc_comment)]
+    #[arg(long, default_value_t = 1)]
     interval: u64,
 }
 
 impl Args {
-    /// Get effective values (profile defaults with CLI overrides applied)
     fn effective_values(&self) -> (u64, u64, u64) {
         let (q, nfb, starv) = self.profile.values();
         (
@@ -257,7 +145,18 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     args: Args,
     topology: topology::TopologyInfo,
-    latency_matrix: Vec<Vec<f64>>,
+    latency_matrix: Arc<Mutex<Vec<Vec<f64>>>>,
+    /// eventfd read end: fires once when ETD calibration completes.
+    /// -1 if creation failed (non-fatal: falls back to 60 s timeout polling).
+    etd_efd: i32,
+}
+
+impl Drop for Scheduler<'_> {
+    fn drop(&mut self) {
+        if self.etd_efd >= 0 {
+            unsafe { libc::close(self.etd_efd) };
+        }
+    }
 }
 
 impl<'a> Scheduler<'a> {
@@ -267,76 +166,122 @@ impl<'a> Scheduler<'a> {
     ) -> Result<Self> {
         use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 
-        // Open and load the BPF skeleton
         let skel_builder = BpfSkelBuilder::default();
-
         let mut open_skel = skel_builder
             .open(open_object)
             .context("Failed to open BPF skeleton")?;
 
-        // Populate SCX enum RODATA from kernel BTF (SCX_DSQ_LOCAL_ON, SCX_KICK_PREEMPT, etc.)
         scx_utils::import_enums!(open_skel);
 
-        // Detect system topology (CCDs, P/E cores)
         let topo = topology::detect()?;
+        let (quantum, new_flow_bonus, _) = args.effective_values();
 
-        // Get effective values (profile + CLI overrides)
-        let (quantum, new_flow_bonus, _starvation) = args.effective_values();
+        // ── eventfd for ETD completion notification ───────────────────────
+        // The background thread writes to this fd when calibration finishes.
+        // The event loop polls [signalfd, etd_efd] and shrinks to [signalfd]
+        // after the eventfd fires — matching s6's dynamic poll-set pattern.
+        //
+        // EFD_NONBLOCK: read() returns EAGAIN instead of blocking when empty.
+        // EFD_CLOEXEC:  not inherited across exec.
+        let etd_efd = unsafe {
+            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+        };
+        if etd_efd < 0 {
+            warn!(
+                "Failed to create ETD eventfd ({}), falling back to 60s timeout polling",
+                std::io::Error::last_os_error()
+            );
+        }
 
-        // ETD: Empirical Topology Discovery — display-grade measurement
-        // Measures inter-core CAS latency for startup heatmap and TUI display
-        info!("Starting ETD calibration...");
-        let latency_matrix = calibrate::calibrate_full_matrix(
-            topo.nr_cpus,
-            &calibrate::EtdConfig::default(),
-            |current, total, is_complete| {
-                tui::render_calibration_progress(current, total, is_complete);
-            },
-        );
+        // Duplicate the fd for the background thread (write end).
+        // Scheduler owns etd_efd (read, closed in Drop).
+        // Thread owns etd_efd_write (write, closed by thread after signalling).
+        let etd_efd_write = if etd_efd >= 0 {
+            let fd = unsafe { libc::dup(etd_efd) };
+            if fd < 0 {
+                warn!("dup(etd_efd) failed — falling back to timeout polling");
+                -1i32
+            } else {
+                fd
+            }
+        } else {
+            -1i32
+        };
 
-        // Configure the scheduler via rodata (read-only data)
+        info!("Starting ETD calibration in background...");
+        let nr_cpus_cal = topo.nr_cpus;
+        let latency_matrix = Arc::new(Mutex::new(vec![vec![0.0f64; nr_cpus_cal]; nr_cpus_cal]));
+        let matrix_bg = latency_matrix.clone();
+        let is_verbose = args.verbose;
+
+        std::thread::spawn(move || {
+            let result = calibrate::calibrate_full_matrix(
+                nr_cpus_cal,
+                &calibrate::EtdConfig::default(),
+                |current, total, is_complete| {
+                    if !is_verbose {
+                        tui::render_calibration_progress(current, total, is_complete);
+                    }
+                },
+            );
+            match matrix_bg.lock() {
+                Ok(mut m)  => *m = result,
+                Err(e)     => *e.into_inner() = result,
+            }
+            // Signal ETD completion.  The event loop wakes within microseconds
+            // and writes the LLC cost table — not up to 1 second later.
+            if etd_efd_write >= 0 {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(
+                        etd_efd_write,
+                        &val as *const u64 as *const libc::c_void,
+                        8,
+                    );
+                    libc::close(etd_efd_write);
+                }
+            }
+        });
+
+        // Configure BPF rodata
         if let Some(rodata) = &mut open_skel.maps.rodata_data {
-            rodata.quantum_ns = quantum * 1000;
+            rodata.quantum_ns       = quantum * 1000;
             rodata.new_flow_bonus_ns = new_flow_bonus * 1000;
-            rodata.enable_stats = args.verbose;
-            rodata.tier_configs = args.profile.tier_configs(quantum);
+            rodata.enable_stats     = args.verbose;
+            rodata.tier_configs     = args.profile.tier_configs(quantum, args.starvation);
+            rodata.has_hybrid       = topo.has_hybrid_cores;
 
-            // Topology: only has_hybrid is live (DVFS scaling in cake_tick)
-            rodata.has_hybrid = topo.has_hybrid_cores;
-
-            // Per-LLC DSQ partitioning: populate CPU→LLC mapping
             let llc_count = topo.llc_cpu_mask.iter().filter(|&&m| m != 0).count() as u32;
             rodata.nr_llcs = llc_count.max(1);
-            rodata.nr_cpus = topo.nr_cpus.min(64) as u32; // Rule 39: bounds kick scan loop
+            rodata.nr_cpus = topo.nr_cpus.min(64) as u32;
             for (i, &llc_id) in topo.cpu_llc_id.iter().enumerate() {
                 rodata.cpu_llc_id[i] = llc_id as u32;
             }
+            // NOTE: llc_cpu_mask is NOT written from Rust.
+            // imperator_init (BPF side) computes it from cpu_llc_id at scheduler
+            // attachment time — before any task is scheduled.  This eliminates
+            // the partial-deploy hazard where a missing write left the mask
+            // all-zeros, causing silent kick failures.
         }
 
-        // Load the BPF program
         let skel = open_skel.load().context("Failed to load BPF program")?;
 
-        Ok(Self {
-            skel,
-            args,
-            topology: topo,
-            latency_matrix,
-        })
+        Ok(Self { skel, args, topology: topo, latency_matrix, etd_efd })
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
-        // Attach the scheduler
         let _link = self
             .skel
             .maps
-            .cake_ops
+            .imperator_ops
             .attach_struct_ops()
             .context("Failed to attach scheduler")?;
 
         self.show_startup_splash()?;
 
+        let mut etd_written = self.try_write_etd_costs();
+
         if self.args.verbose {
-            // Run TUI mode
             tui::run_tui(
                 &mut self.skel,
                 shutdown.clone(),
@@ -344,59 +289,99 @@ impl<'a> Scheduler<'a> {
                 self.topology.clone(),
             )?;
         } else {
-            // Event-based silent mode - block on signalfd, poll with 60s timeout for UEI check
-
-            // Block SIGINT and SIGTERM from normal delivery
             let mut mask = SigSet::empty();
             mask.add(Signal::SIGINT);
             mask.add(Signal::SIGTERM);
             mask.thread_block().context("Failed to block signals")?;
 
-            // Create signalfd to receive signals as readable events
             let sfd = SignalFd::with_flags(&mask, SfdFlags::SFD_NONBLOCK)
                 .context("Failed to create signalfd")?;
 
             use nix::poll::{poll, PollFd, PollFlags};
             use std::os::fd::BorrowedFd;
 
+            // Build a fixed-size poll array.  fds[0] = signalfd (always polled).
+            // fds[1] = etd_efd when available, else signalfd again as a dummy
+            // (safe: n_fds == 1 when etd_efd < 0, so fds[1] is never passed to poll).
+            //
+            // Constructing both entries from raw fds avoids moving signal_pfd
+            // into the else-arm before using it in the array (PollFd is not Copy).
+            let active_etd_fd = if self.etd_efd >= 0 { self.etd_efd } else { sfd.as_raw_fd() };
+            let mut fds = unsafe {
+                [
+                    PollFd::new(BorrowedFd::borrow_raw(sfd.as_raw_fd()), PollFlags::POLLIN),
+                    PollFd::new(BorrowedFd::borrow_raw(active_etd_fd),   PollFlags::POLLIN),
+                ]
+            };
+
             loop {
-                // Block for up to 60 seconds, then check UEI
-                // poll() returns: >0 = readable, 0 = timeout, -1 = error
-                // SAFETY: sfd is valid for the duration of this loop
-                let poll_fd = unsafe {
-                    PollFd::new(BorrowedFd::borrow_raw(sfd.as_raw_fd()), PollFlags::POLLIN)
-                };
-                let mut fds = [poll_fd];
-                let result = poll(&mut fds, nix::poll::PollTimeout::from(60_000u16)); // 60 seconds
+                // Dynamic fd count: mirrors s6's `iopause_g(x, 2 + (notifyfd >= 0))`.
+                // After ETD fires (etd_written=true) or if the fd is unavailable,
+                // shrink to 1 — steady state polls only the signalfd.
+                let n_fds: usize = if etd_written || self.etd_efd < 0 { 1 } else { 2 };
+
+                let result = poll(&mut fds[..n_fds], nix::poll::PollTimeout::from(60_000u16));
 
                 match result {
                     Ok(n) if n > 0 => {
-                        // Signal received - read it to clear and exit
-                        if let Ok(Some(siginfo)) = sfd.read_signal() {
-                            info!("Received signal {} - shutting down", siginfo.ssi_signo);
-                            shutdown.store(true, Ordering::Relaxed);
+                        // Check etd eventfd first (non-blocking — EAGAIN if signalfd-only event).
+                        if !etd_written && self.etd_efd >= 0 {
+                            let mut val = 0u64;
+                            let r = unsafe {
+                                libc::read(
+                                    self.etd_efd,
+                                    &mut val as *mut u64 as *mut libc::c_void,
+                                    8,
+                                )
+                            };
+                            if r == 8 {
+                                etd_written = self.try_write_etd_costs();
+                                if !etd_written {
+                                    warn!("ETD eventfd fired but matrix still empty — will retry at next timeout");
+                                }
+                            }
                         }
-                        break;
+
+                        // Check signalfd.
+                        match sfd.read_signal() {
+                            Ok(Some(siginfo)) => {
+                                // Exhaustive match — unexpected signals are programming errors.
+                                match siginfo.ssi_signo as i32 {
+                                    libc::SIGINT | libc::SIGTERM => {
+                                        info!("Received signal {} — shutting down", siginfo.ssi_signo);
+                                        shutdown.store(true, Ordering::Relaxed);
+                                    }
+                                    other => {
+                                        warn!("Unexpected signal {} on signalfd — this is a bug", other);
+                                    }
+                                }
+                                break;
+                            }
+                            Ok(None) | Err(nix::errno::Errno::EAGAIN) => {
+                                // signalfd not ready — only ETD fd fired; continue.
+                            }
+                            Err(e) => {
+                                warn!("read_signal error: {}", e);
+                                break;
+                            }
+                        }
                     }
                     Ok(_) => {
-                        // Timeout - check UEI
+                        // 60 s timeout: retry ETD write (covers eventfd-unavailable path)
+                        // and check for BPF scheduler exit via UEI.
+                        if !etd_written {
+                            etd_written = self.try_write_etd_costs();
+                        }
                         if scx_utils::uei_exited!(&self.skel, uei) {
                             match scx_utils::uei_report!(&self.skel, uei) {
-                                Ok(reason) => {
-                                    warn!("BPF scheduler exited: {:?}", reason);
-                                }
-                                Err(e) => {
-                                    warn!("BPF scheduler exited (failed to get reason: {})", e);
-                                }
+                                Ok(reason) => warn!("BPF scheduler exited: {:?}", reason),
+                                Err(e)     => warn!("BPF scheduler exited (reason unavailable: {})", e),
                             }
                             break;
                         }
                     }
                     Err(nix::errno::Errno::EINTR) => {
-                        // Interrupted - check shutdown flag
-                        if shutdown.load(Ordering::Relaxed) {
-                            break;
-                        }
+                        if shutdown.load(Ordering::Relaxed) { break; }
                     }
                     Err(e) => {
                         warn!("poll() error: {}", e);
@@ -406,17 +391,80 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        info!("scx_cake scheduler shutting down");
+        info!("scx_imperator scheduler shutting down");
         Ok(())
+    }
+
+    /// Compress the ETD matrix into per-LLC-pair costs and write to BPF BSS.
+    ///
+    /// Returns true when data was written, false when calibration is still
+    /// in progress (matrix all-zeros) or the mutex is contested.
+    ///
+    /// Uses try_lock() so a contested mutex causes a fast retry at the next
+    /// wakeup rather than blocking the event loop.  With the eventfd mechanism,
+    /// the thread releases the mutex before firing the fd, so contention in
+    /// practice is impossible — try_lock() is defense-in-depth.
+    fn try_write_etd_costs(&mut self) -> bool {
+        let matrix = match self.latency_matrix.try_lock() {
+            Ok(m)  => m.clone(),
+            Err(_) => return false,
+        };
+
+        if !matrix.iter().flatten().any(|&v| v > 0.0) {
+            return false;
+        }
+
+        let nr_cpus = matrix.len().min(topology::MAX_CPUS);
+        let nr_llcs = self
+            .topology
+            .llc_cpu_mask
+            .iter()
+            .filter(|&&m| m != 0)
+            .count()
+            .min(topology::MAX_LLCS);
+
+        let matrix_ref = &matrix;
+
+        if let Some(bss) = &mut self.skel.maps.bss_data {
+            for llc_a in 0..nr_llcs {
+                for llc_b in 0..nr_llcs {
+                    if llc_a == llc_b { continue; }
+                    let min_ns = (0..nr_cpus)
+                        .filter(|&ca| self.topology.cpu_llc_id[ca] as usize == llc_a)
+                        .flat_map(|ca| {
+                            (0..nr_cpus)
+                                .filter(|&cb| self.topology.cpu_llc_id[cb] as usize == llc_b)
+                                .filter_map(move |cb| {
+                                    let v = matrix_ref[ca][cb];
+                                    if v > 0.0 { Some(v) } else { None }
+                                })
+                        })
+                        .fold(f64::MAX, f64::min);
+
+                    let cost: u8 = if min_ns == f64::MAX {
+                        0
+                    } else {
+                        ((min_ns / 4.0) as u64).min(255) as u8
+                    };
+                    bss.llc_etd_cost[llc_a][llc_b] = cost;
+                }
+            }
+            info!("ETD: LLC cost table written ({} LLCs)", nr_llcs);
+        }
+        true
     }
 
     fn show_startup_splash(&self) -> Result<()> {
         let (q, _nfb, starv) = self.args.effective_values();
         let profile_str = format!("{:?}", self.args.profile).to_uppercase();
-
+        let matrix = self
+            .latency_matrix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         tui::render_startup_screen(tui::StartupParams {
             topology: &self.topology,
-            latency_matrix: &self.latency_matrix,
+            latency_matrix: &matrix,
             profile: &profile_str,
             quantum: q,
             starvation: starv,
@@ -426,24 +474,10 @@ impl<'a> Scheduler<'a> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let args = Args::parse();
-
-    // Set up signal handler
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    ctrlc::set_handler(move || {
-        info!("Received shutdown signal");
-        shutdown_clone.store(true, Ordering::Relaxed);
-    })?;
-
-    // Create open object for BPF - needs to outlive scheduler
     let mut open_object = std::mem::MaybeUninit::uninit();
-
-    // Create and run the scheduler
     let mut scheduler = Scheduler::new(args, &mut open_object)?;
     scheduler.run(shutdown)?;
-
     Ok(())
 }
