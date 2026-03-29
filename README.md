@@ -75,7 +75,7 @@ Every task is classified into one of four tiers based on its **EWMA** (Exponenti
 | **T2** | Frame | < 8ms | Game render threads, video encoding | 40ms |
 | **T3** | Bulk | ≥ 8ms | Compilation, background indexing | 100ms |
 
-T0 always runs before T1, which always runs before T2, and so on. This ordering is encoded directly in the dispatch queue sort key — no per-dispatch branching to enforce it.
+T0 always runs before T1, which always runs before T2 and so on. This ordering is encoded directly in the dispatch queue sort key — no per-dispatch branching to enforce it.
 
 > [!TIP]
 > **No game task should be in T3.** Game render threads run 2–8ms per frame → T2. Physics/AI run 0.5–2ms → T1. Input handlers run < 100µs → T0. Only tasks doing 8ms+ of uninterrupted CPU work (shader compilation, loading screens) land in T3.
@@ -236,7 +236,7 @@ The added cost relative to a minimal sched_ext skeleton is approximately 20%, co
 | Term | Definition |
 | :--- | :--- |
 | **EWMA** | Exponential Weighted Moving Average. Tracks task runtime with asymmetric decay — promotions converge in ~4 bouts, demotions in ~16. |
-| **Tier** | Classification level (T0–T3) by avg_runtime. Controls slice size, starvation window, vtime priority, and DVFS target. |
+| **Tier** | Classification level (T0–T3) by avg_runtime. Controls slice size, starvation window, vtime priority and DVFS target. |
 | **Deficit** | Per-task credit from DRR++. New tasks get bonus credit; exhaustion removes the bonus and the task competes normally. |
 | **Quantum** | Base time slice allotted before a scheduling decision. Scaled by tier multiplier. |
 | **Starvation** | Maximum time a task can wait without running before preemption is forced, regardless of tier ordering. |
@@ -274,8 +274,3 @@ The added cost relative to a minimal sched_ext skeleton is approximately 20%, co
 | IRQ-source wakeup detection | scx_lavd (`lavd_select_cpu`) |
 | Waker tier inheritance | scx_lavd (`lat_cri_waker/wakee`) |
 | Lock-holder detection and starvation skip | scx_lavd (`lock.bpf.c`) |
-
----
-
-**License**: GPL-2.0  
-**Maintainer**: Michael-Sebero
